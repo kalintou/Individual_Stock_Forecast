@@ -1,0 +1,15 @@
+# MCP Server Configuration
+# Copy this directory and customize for your new tool
+
+name: my_tool
+
+server:
+  # Command to start the MCP server
+  command: [".venv/bin/python", "server.py"]
+  
+  # Working directory (relative to this config file)
+  working_dir: "."
+  
+  # Environment variables
+  env:
+    # MY_VAR: "value"

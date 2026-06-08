@@ -1,0 +1,11 @@
+[project]
+name = "my-tool"
+version = "1.0.0"
+description = "A template MCP tool"
+requires-python = ">=3.11"
+dependencies = [
+    # Add your tool's dependencies here
+]
+
+[project.scripts]
+my-tool = "server:main"

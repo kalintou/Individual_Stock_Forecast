@@ -1,0 +1,25 @@
+﻿# environment
+.env
+.env.*
+frontend/.env.local
+frontend/.env.*.local
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+# logs
+*.log
+trace/
+traces/
+
+# system
+.DS_Store
+EOF

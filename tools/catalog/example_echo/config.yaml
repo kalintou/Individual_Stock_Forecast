@@ -1,0 +1,6 @@
+name: example_echo
+
+server:
+  command: ["python", "server.py"]
+  working_dir: "."
+  env: {}
