@@ -18,7 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from backend.market_data import fetch_chart_data, fetch_hot_stocks
+from backend.market_data import debug_hot_stocks, fetch_chart_data, fetch_hot_stocks
 from backend.schemas import ALLOWED_FACTORS, AnalyzeRequest, HealthResponse
 from backend.serializers import build_analyze_response, sanitize_trace, to_jsonable
 from graph.trace import clear_trace, drop_trace, get_trace_entries
@@ -200,6 +200,13 @@ def get_prompts() -> dict[str, str]:
 def hot_stocks(top_n: int = 30) -> list[dict]:
     top_n = max(1, min(int(top_n or 30), 100))
     return fetch_hot_stocks(top_n=top_n)
+
+
+@app.get("/api/hot-stocks/debug")
+def hot_stocks_debug(top_n: int = 10) -> dict:
+    """诊断热门股票名称/涨幅补全是否成功。"""
+    top_n = max(1, min(int(top_n or 10), 30))
+    return debug_hot_stocks(top_n=top_n)
 
 
 @app.get("/api/chart-data/{stock_code}")
