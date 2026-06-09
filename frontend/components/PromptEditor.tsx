@@ -55,7 +55,7 @@ export function PromptEditor({ value, onChange }: PromptEditorProps) {
       <button type="button" className="flex w-full items-center justify-between text-left" onClick={() => setOpen(!open)}>
         <div>
           <h2 className="text-base font-semibold text-slate-900">高级设置：追加 System Prompt</h2>
-          <p className="mt-1 text-sm text-slate-500">这里填写的内容不会覆盖默认 prompts/*.md，只会在本次请求中追加到默认 system prompt 后面。</p>
+          {/* <p className="mt-1 text-sm text-slate-500">这里填写的内容不会覆盖默认 prompts/*.md，只会在本次请求中追加到默认 system prompt 后面。</p> */}
         </div>
         <ChevronDown className={`h-5 w-5 text-slate-500 transition ${open ? "rotate-180" : ""}`} />
       </button>

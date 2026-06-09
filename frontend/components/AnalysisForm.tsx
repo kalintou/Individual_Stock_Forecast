@@ -37,7 +37,7 @@ export function AnalysisForm({
     <section className="card p-5">
       <div className="mb-3 flex flex-col justify-between gap-3 lg:flex-row lg:items-center">
         <label className="block text-sm font-semibold text-slate-800">股票 / 问题输入</label>
-        <div className="flex flex-wrap items-center gap-2">
+        {/* <div className="flex flex-wrap items-center gap-2">
           <span className="mr-1 text-xs font-medium text-slate-500">分析因子</span>
           {factors.map((key) => {
             const checked = selectedFactors.includes(key);
@@ -56,7 +56,7 @@ export function AnalysisForm({
               </button>
             );
           })}
-        </div>
+        </div> */}
       </div>
 
       <div className="flex flex-col gap-3 lg:flex-row">
@@ -64,7 +64,7 @@ export function AnalysisForm({
           className="input min-h-[92px] flex-1 resize-none"
           value={query}
           onChange={(event) => onQueryChange(event.target.value)}
-          placeholder="请输入股票代码、股票名称或分析问题，例如：分析一下贵州茅台短期中期长期怎么看"
+          placeholder="请输入股票代码、股票名称或分析问题，例如：分析一下 贵州茅台（600519）"
         />
         <button className="btn-primary h-fit lg:min-w-32" onClick={onSubmit} disabled={loading}>
           {loading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Search className="mr-2 h-4 w-4" />}

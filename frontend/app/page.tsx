@@ -26,7 +26,7 @@ function cleanPromptAppend(value: PromptAppendState): Record<string, string> {
 }
 
 export default function Page() {
-  const [query, setQuery] = useState("分析一下贵州茅台短期中期长期怎么看");
+  const [query, setQuery] = useState("分析一下 贵州茅台（600519）");
   const [selectedFactors, setSelectedFactors] = useState<FactorKey[]>(defaultFactors);
   const [promptAppend, setPromptAppend] = useState<PromptAppendState>(defaultPromptAppend);
   const [loading, setLoading] = useState(false);
