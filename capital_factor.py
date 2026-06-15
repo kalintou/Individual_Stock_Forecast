@@ -182,28 +182,363 @@ def _recent_weekdays(days: int = 20) -> list[str]:
 
 def fetch_capital_flow(stock_code: str, days: int = 20) -> pd.DataFrame:
     """
-    获取个股资金流数据。
-    主数据源：ak.stock_individual_fund_flow(stock=..., market=...)
+    获取个股资金流，所有容错逻辑均封装在本函数内，避免遗漏辅助函数。
+
+    数据源顺序：
+    1. 东方财富历史资金流接口（多个域名 + 重试）
+    2. 东方财富单股实时资金快照接口
+    3. 同花顺资金流接口（与东方财富不同的数据源）
+    4. 本地最近成功缓存
     """
-    if ak is None:
-        raise RuntimeError("akshare is not installed. Please run: pip install akshare")
+    import datetime as _dt
+    import json as _json
+    import os as _os
+    import random as _random
+    import time as _time
+    from pathlib import Path as _Path
 
-    code = str(stock_code).strip()[-6:]
+    code = str(stock_code).strip().upper()
+    for suffix in (".SH", ".SZ", ".BJ", "SH", "SZ", "BJ"):
+        code = code.replace(suffix, "")
+    code = code[-6:]
     market = resolve_market(code)
+    secid = f"{'1' if market == 'sh' else '0'}.{code}"
+    limit = max(1, int(days))
 
-    df = ak.stock_individual_fund_flow(stock=code, market=market)
+    columns = [
+        "日期", "收盘价", "涨跌幅",
+        "主力净流入-净额", "主力净流入-净占比",
+        "超大单净流入-净额", "超大单净流入-净占比",
+        "大单净流入-净额", "大单净流入-净占比",
+        "中单净流入-净额", "中单净流入-净占比",
+        "小单净流入-净额", "小单净流入-净占比",
+    ]
+    errors: list[str] = []
 
-    if df is None or df.empty:
-        raise ValueError(f"No capital flow data returned for {stock_code}")
+    def _number(value: Any) -> float:
+        if value is None:
+            return 0.0
+        if isinstance(value, (int, float)):
+            try:
+                return 0.0 if math.isnan(float(value)) else float(value)
+            except Exception:
+                return 0.0
 
-    date_col = _find_col(df, ["日期", "date"])
-    if date_col:
-        df = df.copy()
-        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-        df = df.dropna(subset=[date_col]).sort_values(date_col)
+        text = str(value).strip().replace(",", "").replace("%", "")
+        if text in {"", "-", "--", "None", "nan"}:
+            return 0.0
 
-    return df.tail(days).reset_index(drop=True)
+        multiplier = 1.0
+        if text.endswith("万"):
+            multiplier = 1e4
+            text = text[:-1]
+        elif text.endswith("亿"):
+            multiplier = 1e8
+            text = text[:-1]
 
+        try:
+            return float(text) * multiplier
+        except Exception:
+            return 0.0
+
+    def _normalise(df: pd.DataFrame, source: str) -> pd.DataFrame:
+        if df is None or df.empty:
+            raise ValueError(f"{source} returned empty data")
+
+        out = df.copy()
+        for col in columns:
+            if col not in out.columns:
+                out[col] = 0.0
+
+        out["日期"] = pd.to_datetime(out["日期"], errors="coerce")
+        out = out.dropna(subset=["日期"]).sort_values("日期")
+        if out.empty:
+            raise ValueError(f"{source} returned no valid trade date")
+
+        for col in columns[1:]:
+            out[col] = out[col].map(_number)
+
+        out = out[columns].tail(limit).reset_index(drop=True)
+        out.attrs["data_source"] = source
+        return out
+
+    cache_dir = _Path(
+        _os.getenv(
+            "CAPITAL_CACHE_DIR",
+            str(_Path(_os.getenv("TMPDIR", "/tmp")) / "stock_forecast_capital_cache"),
+        )
+    )
+    cache_file = cache_dir / f"{code}.json"
+
+    def _save_cache(df: pd.DataFrame) -> None:
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "saved_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                "source": df.attrs.get("data_source", "unknown"),
+                "records": df[columns].to_dict(orient="records"),
+            }
+            temp_file = cache_file.with_suffix(".tmp")
+            temp_file.write_text(
+                _json.dumps(payload, ensure_ascii=False, default=str),
+                encoding="utf-8",
+            )
+            temp_file.replace(cache_file)
+        except Exception:
+            pass
+
+    def _load_cache() -> pd.DataFrame:
+        if not cache_file.exists():
+            return pd.DataFrame()
+        try:
+            payload = _json.loads(cache_file.read_text(encoding="utf-8"))
+            saved_at = _dt.datetime.fromisoformat(str(payload["saved_at"]))
+            if saved_at.tzinfo is None:
+                saved_at = saved_at.replace(tzinfo=_dt.timezone.utc)
+
+            max_age = float(_os.getenv("CAPITAL_CACHE_MAX_AGE_HOURS", "168"))
+            age = (
+                _dt.datetime.now(_dt.timezone.utc) - saved_at
+            ).total_seconds() / 3600
+            if age > max_age:
+                return pd.DataFrame()
+
+            result = _normalise(
+                pd.DataFrame(payload.get("records") or []),
+                f"cache:{payload.get('source', 'unknown')}",
+            )
+            result.attrs["stale_cache"] = True
+            return result
+        except Exception:
+            return pd.DataFrame()
+
+    def _get_json(url: str, params: dict[str, Any]) -> dict[str, Any]:
+        timeout = float(_os.getenv("CAPITAL_HTTP_TIMEOUT", "6"))
+        headers = {
+            "Accept": "application/json,text/plain,*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
+            "Connection": "close",
+            "Referer": "https://data.eastmoney.com/",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+        }
+        request_errors: list[str] = []
+
+        try:
+            from curl_cffi import requests as _curl_requests
+
+            response = _curl_requests.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=timeout,
+                impersonate="chrome",
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if isinstance(payload, dict):
+                return payload
+            raise ValueError("response JSON is not an object")
+        except Exception as exc:
+            request_errors.append(f"curl_cffi: {type(exc).__name__}: {exc}")
+
+        try:
+            import requests as _requests
+
+            session = _requests.Session()
+            session.trust_env = False
+            response = session.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=(3.05, timeout),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if isinstance(payload, dict):
+                return payload
+            raise ValueError("response JSON is not an object")
+        except Exception as exc:
+            request_errors.append(f"requests: {type(exc).__name__}: {exc}")
+
+        raise RuntimeError("; ".join(request_errors))
+
+    # 1. 东方财富历史资金流
+    history_urls = [
+        "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get",
+        "https://1.push2his.eastmoney.com/api/qt/stock/fflow/daykline/get",
+        "https://push2.eastmoney.com/api/qt/stock/fflow/daykline/get",
+    ]
+    retries = max(1, int(_os.getenv("CAPITAL_FETCH_RETRIES", "3")))
+
+    for attempt in range(retries):
+        for url in history_urls:
+            try:
+                payload = _get_json(
+                    url,
+                    {
+                        "lmt": str(max(20, limit)),
+                        "klt": "101",
+                        "secid": secid,
+                        "fields1": "f1,f2,f3,f7",
+                        "fields2": (
+                            "f51,f52,f53,f54,f55,f56,f57,f58,f59,"
+                            "f60,f61,f62,f63,f64,f65"
+                        ),
+                        "ut": "b2884a393a59ad64002292a3e90d46a5",
+                        "_": int(_time.time() * 1000),
+                    },
+                )
+                klines = (payload.get("data") or {}).get("klines") or []
+                rows = []
+                for item in klines:
+                    parts = str(item).split(",")
+                    if len(parts) >= 13:
+                        rows.append(parts[:13])
+
+                raw_columns = [
+                    "日期",
+                    "主力净流入-净额",
+                    "小单净流入-净额",
+                    "中单净流入-净额",
+                    "大单净流入-净额",
+                    "超大单净流入-净额",
+                    "主力净流入-净占比",
+                    "小单净流入-净占比",
+                    "中单净流入-净占比",
+                    "大单净流入-净占比",
+                    "超大单净流入-净占比",
+                    "收盘价",
+                    "涨跌幅",
+                ]
+                result = _normalise(
+                    pd.DataFrame(rows, columns=raw_columns),
+                    "eastmoney_history",
+                )
+                _save_cache(result)
+                return result
+            except Exception as exc:
+                errors.append(
+                    f"history[{attempt + 1}] {url}: {type(exc).__name__}: {exc}"
+                )
+
+        if attempt + 1 < retries:
+            _time.sleep(min(2.0, 0.4 * (2 ** attempt)) + _random.uniform(0.05, 0.2))
+
+    # 2. 东方财富单股实时资金快照
+    snapshot_urls = [
+        "https://push2.eastmoney.com/api/qt/stock/get",
+        "https://1.push2.eastmoney.com/api/qt/stock/get",
+        "https://22.push2.eastmoney.com/api/qt/stock/get",
+        "https://88.push2.eastmoney.com/api/qt/stock/get",
+    ]
+    snapshot_fields = "f57,f58,f43,f170,f62,f184,f66,f69,f72,f75,f78,f81,f84,f87,f124"
+
+    for url in snapshot_urls:
+        try:
+            payload = _get_json(
+                url,
+                {
+                    "secid": secid,
+                    "fields": snapshot_fields,
+                    "fltt": "2",
+                    "invt": "2",
+                    "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+                    "_": int(_time.time() * 1000),
+                },
+            )
+            data = payload.get("data") or {}
+            if str(data.get("f57", "")).zfill(6) != code:
+                raise ValueError("snapshot stock code does not match")
+
+            timestamp = _number(data.get("f124"))
+            trade_date = (
+                _dt.datetime.fromtimestamp(timestamp).date().isoformat()
+                if timestamp > 0
+                else _dt.date.today().isoformat()
+            )
+            result = _normalise(
+                pd.DataFrame(
+                    [{
+                        "日期": trade_date,
+                        "收盘价": data.get("f43", 0),
+                        "涨跌幅": data.get("f170", 0),
+                        "主力净流入-净额": data.get("f62", 0),
+                        "主力净流入-净占比": data.get("f184", 0),
+                        "超大单净流入-净额": data.get("f66", 0),
+                        "超大单净流入-净占比": data.get("f69", 0),
+                        "大单净流入-净额": data.get("f72", 0),
+                        "大单净流入-净占比": data.get("f75", 0),
+                        "中单净流入-净额": data.get("f78", 0),
+                        "中单净流入-净占比": data.get("f81", 0),
+                        "小单净流入-净额": data.get("f84", 0),
+                        "小单净流入-净占比": data.get("f87", 0),
+                    }]
+                ),
+                "eastmoney_snapshot",
+            )
+            _save_cache(result)
+            return result
+        except Exception as exc:
+            errors.append(f"snapshot {url}: {type(exc).__name__}: {exc}")
+
+    # 3. 独立备用源：同花顺。这里只在东方财富全部失败后执行。
+    if ak is not None:
+        for symbol in ("即时", "5日排行", "3日排行"):
+            try:
+                ths_df = ak.stock_fund_flow_individual(symbol=symbol)
+                if ths_df is None or ths_df.empty:
+                    continue
+
+                code_col = _find_col(ths_df, ["股票代码", "代码"])
+                if code_col is None:
+                    continue
+
+                matched = ths_df[
+                    ths_df[code_col].astype(str).str.extract(r"(\d+)", expand=False).str.zfill(6) == code
+                ]
+                if matched.empty:
+                    continue
+
+                row = matched.iloc[0]
+                price_col = _find_col(ths_df, ["最新价", "收盘价"])
+                pct_col = _find_col(ths_df, ["涨跌幅", "阶段涨跌幅"])
+                net_col = _find_col(ths_df, ["净额", "资金流入净额"])
+                turnover_col = _find_col(ths_df, ["成交额"])
+
+                net_amount = _number(row.get(net_col)) if net_col else 0.0
+                turnover = _number(row.get(turnover_col)) if turnover_col else 0.0
+                net_ratio = net_amount / turnover * 100 if turnover else 0.0
+
+                result = _normalise(
+                    pd.DataFrame(
+                        [{
+                            "日期": _dt.date.today().isoformat(),
+                            "收盘价": row.get(price_col, 0) if price_col else 0,
+                            "涨跌幅": row.get(pct_col, 0) if pct_col else 0,
+                            "主力净流入-净额": net_amount,
+                            "主力净流入-净占比": net_ratio,
+                        }]
+                    ),
+                    f"ths_{symbol}",
+                )
+                _save_cache(result)
+                return result
+            except Exception as exc:
+                errors.append(f"ths {symbol}: {type(exc).__name__}: {exc}")
+
+    # 4. 在线源全部失败后读取最近一次成功缓存
+    cached = _load_cache()
+    if not cached.empty:
+        return cached
+
+    raise RuntimeError(
+        f"Unable to obtain capital data for {code}; "
+        + " | ".join(errors[-8:])
+    )
 
 def fetch_fund_flow_rank(stock_code: str, indicator: str = "5日") -> pd.DataFrame:
     """
@@ -466,32 +801,36 @@ def calculate_capital_indicators(
     margin_df: Optional[pd.DataFrame] = None,
     rank_df: Optional[pd.DataFrame] = None,
 ) -> dict[str, Any]:
-    """
-    根据资金流数据计算资金因子指标。
-    """
+    """根据实际拿到的数据量计算资金指标，不用单日快照冒充 3 日/5 日历史。"""
     indicators: dict[str, Any] = {
         "data_available": False,
         "data_quality": "empty",
+        "data_source": "unknown",
+        "stale_cache": False,
         "latest_trade_date": None,
+        "raw_rows": 0,
+        "history_days": 0,
+        "has_3d_history": False,
+        "has_5d_history": False,
 
         "latest_main_net_inflow": 0.0,
-        "main_net_inflow_3d_sum": 0.0,
-        "main_net_inflow_5d_sum": 0.0,
-        "main_net_inflow_5d_mean": 0.0,
-        "main_net_inflow_ratio_5d_mean": 0.0,
+        "latest_main_net_inflow_ratio": None,
+        "main_net_inflow_3d_sum": None,
+        "main_net_inflow_5d_sum": None,
+        "main_net_inflow_5d_mean": None,
+        "main_net_inflow_ratio_5d_mean": None,
 
-        "latest_super_large_net_inflow": 0.0,
-        "latest_large_net_inflow": 0.0,
-        "latest_medium_net_inflow": 0.0,
-        "latest_small_net_inflow": 0.0,
+        "latest_super_large_net_inflow": None,
+        "latest_large_net_inflow": None,
+        "latest_medium_net_inflow": None,
+        "latest_small_net_inflow": None,
+        "flow_level_detail_available": False,
 
         "consecutive_inflow_days": 0,
         "consecutive_outflow_days": 0,
-
         "main_small_divergence": False,
         "accumulation_signal": False,
         "retail_chasing_risk": False,
-
         "abnormal_large_inflow": False,
         "abnormal_large_outflow": False,
 
@@ -500,56 +839,45 @@ def calculate_capital_indicators(
 
         "rank_available": False,
         "fund_flow_rank_summary": None,
-
         "margin_available": False,
         "margin_balance_latest": None,
         "margin_balance_change_rate": None,
         "margin_buy_latest": None,
         "margin_buy_active_ratio": None,
 
-        "raw_rows": 0,
         "warnings": [],
+        "data_notes": [],
     }
 
     if flow_df is None or flow_df.empty:
         indicators["warnings"].append("个股资金流数据为空")
         return indicators
 
+    # attrs 必须在 copy 之前读取，避免不同 pandas 版本丢失 attrs。
+    indicators["data_source"] = str(flow_df.attrs.get("data_source", "unknown"))
+    indicators["stale_cache"] = bool(flow_df.attrs.get("stale_cache", False))
+
     df = flow_df.copy()
     indicators["data_available"] = True
-    indicators["raw_rows"] = len(df)
 
     date_col = _find_col(df, ["日期", "date"])
     main_amt_col = _find_col(df, [
-        "主力净流入-净额",
-        "主力净流入净额",
-        "主力净流入",
-        "主力净额",
+        "主力净流入-净额", "主力净流入净额", "主力净流入", "主力净额",
     ])
     main_ratio_col = _find_col(df, [
-        "主力净流入-净占比",
-        "主力净流入净占比",
-        "主力净占比",
+        "主力净流入-净占比", "主力净流入净占比", "主力净占比",
     ])
     super_amt_col = _find_col(df, [
-        "超大单净流入-净额",
-        "超大单净流入净额",
-        "超大单净流入",
+        "超大单净流入-净额", "超大单净流入净额", "超大单净流入",
     ])
     large_amt_col = _find_col(df, [
-        "大单净流入-净额",
-        "大单净流入净额",
-        "大单净流入",
+        "大单净流入-净额", "大单净流入净额", "大单净流入",
     ])
     medium_amt_col = _find_col(df, [
-        "中单净流入-净额",
-        "中单净流入净额",
-        "中单净流入",
+        "中单净流入-净额", "中单净流入净额", "中单净流入",
     ])
     small_amt_col = _find_col(df, [
-        "小单净流入-净额",
-        "小单净流入净额",
-        "小单净流入",
+        "小单净流入-净额", "小单净流入净额", "小单净流入",
     ])
     pct_col = _find_col(df, ["涨跌幅", "涨跌幅%", "pct_chg", "涨跌幅度"])
 
@@ -562,55 +890,81 @@ def calculate_capital_indicators(
         df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
         df = df.dropna(subset=[date_col]).sort_values(date_col)
 
+    if df.empty:
+        indicators["data_available"] = False
+        indicators["warnings"].append("资金流数据没有有效交易日期")
+        return indicators
+
+    indicators["raw_rows"] = len(df)
+    indicators["history_days"] = len(df)
+    indicators["has_3d_history"] = len(df) >= 3
+    indicators["has_5d_history"] = len(df) >= 5
+
+    if len(df) >= 5:
+        indicators["data_quality"] = "full_history"
+    elif len(df) >= 3:
+        indicators["data_quality"] = "partial_history"
+        indicators["data_notes"].append("当前不足5个交易日，仅计算最新和近3日指标")
+    else:
+        indicators["data_quality"] = "snapshot"
+        indicators["data_notes"].append(
+            f"当前仅获得{len(df)}个交易日数据，不计算近3日和近5日趋势"
+        )
+
+    if indicators["stale_cache"]:
+        indicators["warnings"].append("在线数据源暂不可用，本次使用最近成功缓存")
+
     main_values = [_safe_float(x) for x in df[main_amt_col].tolist()]
-    main_ratio_values = (
-        [_safe_float(x) for x in df[main_ratio_col].tolist()]
-        if main_ratio_col else []
-    )
-
     latest = df.iloc[-1]
-    last3 = main_values[-3:]
-    last5 = main_values[-5:]
-
-    indicators["data_quality"] = "ok"
 
     if date_col:
         latest_date = latest[date_col]
-        indicators["latest_trade_date"] = str(latest_date.date()) if hasattr(latest_date, "date") else str(latest_date)
-
-    indicators["latest_main_net_inflow"] = _safe_float(latest[main_amt_col])
-    indicators["main_net_inflow_3d_sum"] = float(sum(last3))
-    indicators["main_net_inflow_5d_sum"] = float(sum(last5))
-    indicators["main_net_inflow_5d_mean"] = float(sum(last5) / len(last5)) if last5 else 0.0
-
-    if main_ratio_values:
-        last5_ratio = main_ratio_values[-5:]
-        indicators["main_net_inflow_ratio_5d_mean"] = (
-            float(sum(last5_ratio) / len(last5_ratio)) if last5_ratio else 0.0
+        indicators["latest_trade_date"] = (
+            str(latest_date.date()) if hasattr(latest_date, "date") else str(latest_date)
         )
 
-    if super_amt_col:
+    latest_main = _safe_float(latest[main_amt_col])
+    indicators["latest_main_net_inflow"] = latest_main
+
+    if main_ratio_col:
+        indicators["latest_main_net_inflow_ratio"] = _safe_float(latest[main_ratio_col])
+
+    if indicators["has_3d_history"]:
+        indicators["main_net_inflow_3d_sum"] = float(sum(main_values[-3:]))
+
+    if indicators["has_5d_history"]:
+        last5 = main_values[-5:]
+        indicators["main_net_inflow_5d_sum"] = float(sum(last5))
+        indicators["main_net_inflow_5d_mean"] = float(sum(last5) / 5)
+
+        if main_ratio_col:
+            ratio_values = [_safe_float(x) for x in df[main_ratio_col].tolist()]
+            indicators["main_net_inflow_ratio_5d_mean"] = float(sum(ratio_values[-5:]) / 5)
+
+    source = indicators["data_source"].lower()
+    # 同花顺备用接口通常只有主力净额，没有完整的超大单/大单/中单/小单拆分。
+    level_detail_expected = "ths_" not in source
+
+    if level_detail_expected and super_amt_col and large_amt_col and medium_amt_col and small_amt_col:
         indicators["latest_super_large_net_inflow"] = _safe_float(latest[super_amt_col])
-    if large_amt_col:
         indicators["latest_large_net_inflow"] = _safe_float(latest[large_amt_col])
-    if medium_amt_col:
         indicators["latest_medium_net_inflow"] = _safe_float(latest[medium_amt_col])
-    if small_amt_col:
         indicators["latest_small_net_inflow"] = _safe_float(latest[small_amt_col])
+        indicators["flow_level_detail_available"] = True
 
     indicators["consecutive_inflow_days"] = _last_consecutive_count(main_values, positive=True)
     indicators["consecutive_outflow_days"] = _last_consecutive_count(main_values, positive=False)
 
-    latest_main = indicators["latest_main_net_inflow"]
-    latest_small = indicators["latest_small_net_inflow"]
+    small_flow = indicators.get("latest_small_net_inflow")
+    if small_flow is not None:
+        small_flow = _safe_float(small_flow)
+        indicators["main_small_divergence"] = latest_main * small_flow < 0
+        indicators["accumulation_signal"] = latest_main > 0 and small_flow < 0
+        indicators["retail_chasing_risk"] = latest_main < 0 and small_flow > 0
 
-    indicators["main_small_divergence"] = latest_main * latest_small < 0
-    indicators["accumulation_signal"] = latest_main > 0 and latest_small < 0
-    indicators["retail_chasing_risk"] = latest_main < 0 and latest_small > 0
-
-    # 异常资金流：最近 5 日中，最新值显著偏离均值
-    if len(last5) >= 5:
-        mean5 = sum(last5) / len(last5)
+    if indicators["has_5d_history"]:
+        last5 = main_values[-5:]
+        mean5 = sum(last5) / 5
         std5 = pd.Series(last5).std()
         if std5 and not math.isnan(std5):
             indicators["abnormal_large_inflow"] = latest_main > mean5 + 1.5 * std5 and latest_main > 0
@@ -619,58 +973,41 @@ def calculate_capital_indicators(
     if pct_col:
         latest_pct = _safe_float(latest[pct_col])
         indicators["latest_pct_change"] = latest_pct
-        # 股价上涨但主力流出，视为价格和资金背离
         indicators["price_fund_divergence"] = latest_pct > 1.0 and latest_main < 0
 
-    # 个股资金流排名，可选
     if rank_df is not None and not rank_df.empty:
         indicators["rank_available"] = True
-        rank_row = rank_df.iloc[0].to_dict()
         indicators["fund_flow_rank_summary"] = {
-            str(k): str(v)
-            for k, v in rank_row.items()
-            if k is not None
+            str(k): str(v) for k, v in rank_df.iloc[0].to_dict().items() if k is not None
         }
 
-    # 融资融券，可选
     if margin_df is not None and not margin_df.empty:
         margin = margin_df.copy()
-
         margin_balance_col = _find_col(margin, ["融资余额", "融资余额(元)", "融资余额（元）"])
         margin_buy_col = _find_col(margin, ["融资买入额", "融资买入额(元)", "融资买入额（元）"])
 
         if margin_balance_col:
             indicators["margin_available"] = True
-            margin_balance_values = [_safe_float(x) for x in margin[margin_balance_col].tolist()]
-            latest_balance = margin_balance_values[-1]
-            indicators["margin_balance_latest"] = latest_balance
-
-            if len(margin_balance_values) >= 2:
-                prev_balance = margin_balance_values[-2]
-                if abs(prev_balance) > 1e-9:
-                    indicators["margin_balance_change_rate"] = (
-                        (latest_balance - prev_balance) / abs(prev_balance) * 100
-                    )
+            balances = [_safe_float(x) for x in margin[margin_balance_col].tolist()]
+            indicators["margin_balance_latest"] = balances[-1]
+            if len(balances) >= 2 and abs(balances[-2]) > 1e-9:
+                indicators["margin_balance_change_rate"] = (
+                    (balances[-1] - balances[-2]) / abs(balances[-2]) * 100
+                )
 
         if margin_buy_col:
             latest_buy = _safe_float(margin.iloc[-1][margin_buy_col])
             indicators["margin_buy_latest"] = latest_buy
-
             latest_balance = indicators.get("margin_balance_latest")
-            if latest_balance and abs(latest_balance) > 1e-9:
-                indicators["margin_buy_active_ratio"] = latest_buy / abs(latest_balance) * 100
+            if latest_balance is not None and abs(_safe_float(latest_balance)) > 1e-9:
+                indicators["margin_buy_active_ratio"] = (
+                    latest_buy / abs(_safe_float(latest_balance)) * 100
+                )
 
     return indicators
 
-
-# =========================
-# 规则评分
-# =========================
-
 def score_capital_factor(indicators: dict[str, Any]) -> dict[str, Any]:
-    """
-    根据资金指标生成 score、trend_signal、key_findings、risk_flags。
-    """
+    """按实际可用周期评分；没有历史数据时不虚构 3 日/5 日信号。"""
     score = 50
     key_findings: list[str] = []
     risk_flags: list[str] = []
@@ -680,204 +1017,178 @@ def score_capital_factor(indicators: dict[str, Any]) -> dict[str, Any]:
             "score": 50,
             "trend_signal": "Neutral",
             "key_findings": ["资金流数据不可用，资金因子暂按中性处理。"],
-            "risk_flags": ["资金流数据缺失或 AkShare 接口失败，资金面分析置信度下降。"],
+            "risk_flags": ["资金流数据缺失，资金面分析置信度下降。"],
         }
 
     latest_main = _safe_float(indicators.get("latest_main_net_inflow"))
-    sum3 = _safe_float(indicators.get("main_net_inflow_3d_sum"))
-    sum5 = _safe_float(indicators.get("main_net_inflow_5d_sum"))
-    ratio5 = _safe_float(indicators.get("main_net_inflow_ratio_5d_mean"))
+    latest_ratio_raw = indicators.get("latest_main_net_inflow_ratio")
+    latest_ratio = _safe_float(latest_ratio_raw) if latest_ratio_raw is not None else None
+    has_3d = bool(indicators.get("has_3d_history"))
+    has_5d = bool(indicators.get("has_5d_history"))
     inflow_days = int(indicators.get("consecutive_inflow_days") or 0)
     outflow_days = int(indicators.get("consecutive_outflow_days") or 0)
-    super_flow = _safe_float(indicators.get("latest_super_large_net_inflow"))
-    large_flow = _safe_float(indicators.get("latest_large_net_inflow"))
-    medium_flow = _safe_float(indicators.get("latest_medium_net_inflow"))
-    small_flow = _safe_float(indicators.get("latest_small_net_inflow"))
 
-    # 1. 最新主力净流入方向
     if latest_main > 0:
         score += 8
-        key_findings.append(f"最近一个交易日主力资金净流入 {_format_money_cn(latest_main)}。")
+        text = f"最近一个交易日主力资金净流入 {_format_money_cn(latest_main)}"
+        if latest_ratio is not None:
+            text += f"，净流入占比 {latest_ratio:.2f}%"
+        key_findings.append(text + "。")
     elif latest_main < 0:
         score -= 8
-        key_findings.append(f"最近一个交易日主力资金净流出 {_format_money_cn(abs(latest_main))}。")
+        text = f"最近一个交易日主力资金净流出 {_format_money_cn(abs(latest_main))}"
+        if latest_ratio is not None:
+            text += f"，净流入占比 {latest_ratio:.2f}%"
+        key_findings.append(text + "。")
+    else:
+        key_findings.append("最近一个交易日主力资金净额接近 0，单日方向不明显。")
 
-    # 2. 3日、5日资金持续性
-    if sum3 > 0:
-        score += 5
-        key_findings.append(f"近3日主力资金合计净流入 {_format_money_cn(sum3)}。")
-    elif sum3 < 0:
-        score -= 5
-        key_findings.append(f"近3日主力资金合计净流出 {_format_money_cn(abs(sum3))}。")
+    # 单日快照也可以用当日净占比判断强弱，但权重低于完整 5 日均值。
+    if not has_5d and latest_ratio is not None:
+        if latest_ratio >= 5:
+            score += 5
+            key_findings.append(f"当日主力净流入占比达到 {latest_ratio:.2f}%，单日流入力度较强。")
+        elif latest_ratio <= -5:
+            score -= 5
+            risk_flags.append(f"当日主力净流入占比为 {latest_ratio:.2f}%，单日流出压力较大。")
 
-    if sum5 > 0:
-        score += 6
-        key_findings.append(f"近5日主力资金合计净流入 {_format_money_cn(sum5)}。")
-    elif sum5 < 0:
-        score -= 6
-        key_findings.append(f"近5日主力资金合计净流出 {_format_money_cn(abs(sum5))}。")
+    if has_3d:
+        sum3 = _safe_float(indicators.get("main_net_inflow_3d_sum"))
+        if sum3 > 0:
+            score += 5
+            key_findings.append(f"近3日主力资金合计净流入 {_format_money_cn(sum3)}。")
+        elif sum3 < 0:
+            score -= 5
+            risk_flags.append(f"近3日主力资金合计净流出 {_format_money_cn(abs(sum3))}。")
 
-    # 3. 主力净流入占比
-    if ratio5 >= 5:
-        score += 12
-        key_findings.append(f"近5日主力净流入占比均值约为 {ratio5:.2f}%，资金流入强度较高。")
-    elif ratio5 >= 2:
-        score += 6
-        key_findings.append(f"近5日主力净流入占比均值约为 {ratio5:.2f}%，资金面略偏积极。")
-    elif ratio5 <= -5:
-        score -= 12
-        risk_flags.append(f"近5日主力净流入占比均值约为 {ratio5:.2f}%，主力撤离迹象较明显。")
-    elif ratio5 <= -2:
-        score -= 6
-        risk_flags.append(f"近5日主力净流入占比均值约为 {ratio5:.2f}%，资金面偏弱。")
+    if has_5d:
+        sum5 = _safe_float(indicators.get("main_net_inflow_5d_sum"))
+        ratio5 = _safe_float(indicators.get("main_net_inflow_ratio_5d_mean"))
+        if sum5 > 0:
+            score += 6
+            key_findings.append(f"近5日主力资金合计净流入 {_format_money_cn(sum5)}。")
+        elif sum5 < 0:
+            score -= 6
+            risk_flags.append(f"近5日主力资金合计净流出 {_format_money_cn(abs(sum5))}。")
 
-    # 4. 连续净流入/流出
+        if ratio5 >= 5:
+            score += 12
+            key_findings.append(f"近5日主力净流入占比均值为 {ratio5:.2f}%，持续流入力度较高。")
+        elif ratio5 >= 2:
+            score += 6
+            key_findings.append(f"近5日主力净流入占比均值为 {ratio5:.2f}%，资金面偏积极。")
+        elif ratio5 <= -5:
+            score -= 12
+            risk_flags.append(f"近5日主力净流入占比均值为 {ratio5:.2f}%，持续撤离迹象较明显。")
+        elif ratio5 <= -2:
+            score -= 6
+            risk_flags.append(f"近5日主力净流入占比均值为 {ratio5:.2f}%，资金面偏弱。")
+
+    # 连续性至少需要 2 个交易日才有解释意义。
     if inflow_days >= 3:
         score += 10
-        key_findings.append(f"主力资金已连续 {inflow_days} 个交易日净流入，资金持续性较好。")
+        key_findings.append(f"主力资金已连续 {inflow_days} 个交易日净流入，持续性较好。")
     elif inflow_days == 2:
         score += 5
-        key_findings.append("主力资金连续 2 个交易日净流入，短期资金面有所改善。")
+        key_findings.append("主力资金连续 2 个交易日净流入，短期资金面改善。")
 
     if outflow_days >= 3:
         score -= 12
-        risk_flags.append(f"主力资金已连续 {outflow_days} 个交易日净流出，存在资金持续撤离风险。")
+        risk_flags.append(f"主力资金已连续 {outflow_days} 个交易日净流出，存在持续撤离风险。")
     elif outflow_days == 2:
         score -= 6
         risk_flags.append("主力资金连续 2 个交易日净流出，短期资金面偏弱。")
 
-    # 5. 主力与小单背离
-    if indicators.get("accumulation_signal"):
-        score += 10
-        key_findings.append("出现“主力净流入、小单净流出”的结构，可能存在主力吸筹迹象。")
+    if indicators.get("flow_level_detail_available"):
+        super_flow = _safe_float(indicators.get("latest_super_large_net_inflow"))
+        large_flow = _safe_float(indicators.get("latest_large_net_inflow"))
+        medium_flow = _safe_float(indicators.get("latest_medium_net_inflow"))
+        small_flow = _safe_float(indicators.get("latest_small_net_inflow"))
 
-    if indicators.get("retail_chasing_risk"):
-        score -= 12
-        risk_flags.append("出现“主力净流出、小单净流入”的结构，存在散户接盘风险。")
+        if indicators.get("accumulation_signal"):
+            score += 10
+            key_findings.append(
+                f"主力净流入而小单净流出 {_format_money_cn(abs(small_flow))}，资金结构呈现吸筹特征。"
+            )
+        if indicators.get("retail_chasing_risk"):
+            score -= 12
+            risk_flags.append(
+                f"主力净流出而小单净流入 {_format_money_cn(small_flow)}，存在散户承接抛压风险。"
+            )
 
-    # 资金层级结构：超大单 / 大单 / 中单 / 小单
-    if super_flow < 0 and large_flow < 0:
-        risk_flags.append(
-            f"超大单和大单均为净流出，其中超大单净流出 {_format_money_cn(abs(super_flow))}，"
-            f"大单净流出 {_format_money_cn(abs(large_flow))}，显示大资金方向偏弱。"
-        )
+        if super_flow > 0 and large_flow > 0:
+            key_findings.append(
+                f"超大单净流入 {_format_money_cn(super_flow)}、大单净流入 {_format_money_cn(large_flow)}，大资金方向一致偏强。"
+            )
+        elif super_flow < 0 and large_flow < 0:
+            risk_flags.append(
+                f"超大单净流出 {_format_money_cn(abs(super_flow))}、大单净流出 {_format_money_cn(abs(large_flow))}，大资金方向一致偏弱。"
+            )
+        elif (super_flow > 0 > large_flow) or (large_flow > 0 > super_flow):
+            key_findings.append("超大单与大单方向相反，大资金内部存在分歧。")
 
-    if super_flow > 0 and large_flow > 0:
-        key_findings.append(
-            f"超大单和大单均为净流入，其中超大单净流入 {_format_money_cn(super_flow)}，"
-            f"大单净流入 {_format_money_cn(large_flow)}，显示大资金参与度较高。"
-        )
+        if medium_flow > 0 and super_flow < 0 and large_flow < 0:
+            risk_flags.append("中单流入但超大单和大单流出，资金层级分歧明显。")
 
-    if medium_flow > 0 and super_flow < 0 and large_flow < 0:
-        key_findings.append(
-            "中单资金净流入，但超大单和大单净流出，显示不同资金层级之间存在分歧。"
-        )
-
-    if small_flow > 0 and latest_main < 0:
-        risk_flags.append(
-            "小单资金净流入但主力资金净流出，需警惕散户承接主力抛压的风险。"
-        )
-
-    # 6. 异常资金流
     if indicators.get("abnormal_large_inflow"):
         score += 8
-        key_findings.append("最新主力净流入显著高于近5日波动水平，存在异常流入迹象。")
-
+        key_findings.append("最新主力净流入显著高于近5日波动水平，出现异常流入。")
     if indicators.get("abnormal_large_outflow"):
         score -= 10
-        risk_flags.append("最新主力净流出显著高于近5日波动水平，存在异常流出风险。")
-
-    # 8. 资金流排名增强判断
+        risk_flags.append("最新主力净流出显著高于近5日波动水平，出现异常流出。")
     if indicators.get("price_fund_divergence"):
         score -= 6
-        risk_flags.append("股价上涨但主力资金净流出，存在价格与资金背离。")
+        risk_flags.append("股价上涨但主力资金净流出，价格与资金方向背离。")
 
+    # 排名和融资融券只有真正拿到时才参与；缺失不再作为每只股票共同的风险文案。
     rank_summary = indicators.get("fund_flow_rank_summary")
-
     if isinstance(rank_summary, dict):
-        rank_5d_amt = _safe_float(rank_summary.get("5日主力净流入-净额"))
-        rank_5d_ratio = _safe_float(rank_summary.get("5日主力净流入-净占比"))
-
-        if rank_5d_amt < 0 and rank_5d_ratio <= -5:
-            risk_flags.append(
-                f"资金流排名数据也显示近5日主力净流出占比较高，约为 {rank_5d_ratio:.2f}%。"
-            )
-            score -= 3
-
-        elif rank_5d_amt > 0 and rank_5d_ratio >= 5:
-            key_findings.append(
-                f"资金流排名数据也显示近5日主力净流入占比较高，约为 {rank_5d_ratio:.2f}%。"
-            )
+        rank_amt = _safe_float(rank_summary.get("5日主力净流入-净额"))
+        rank_ratio = _safe_float(rank_summary.get("5日主力净流入-净占比"))
+        if rank_amt > 0 and rank_ratio >= 5:
             score += 3
+            key_findings.append(f"横向排名数据确认近5日主力净流入占比为 {rank_ratio:.2f}%。")
+        elif rank_amt < 0 and rank_ratio <= -5:
+            score -= 3
+            risk_flags.append(f"横向排名数据确认近5日主力净流入占比为 {rank_ratio:.2f}%。")
 
-    # 9. 融资融券增强判断
     if indicators.get("margin_available"):
         margin_change = indicators.get("margin_balance_change_rate")
-        margin_active = indicators.get("margin_buy_active_ratio")
-
         if margin_change is not None:
             margin_change = _safe_float(margin_change)
             if margin_change > 3 and latest_main > 0:
                 score += 5
-                key_findings.append(f"融资余额环比上升约 {margin_change:.2f}%，且主力资金净流入，杠杆资金情绪偏积极。")
+                key_findings.append(f"融资余额环比上升 {margin_change:.2f}%，与主力流入形成共振。")
             elif margin_change > 5 and latest_main < 0:
                 score -= 5
-                risk_flags.append(f"融资余额环比上升约 {margin_change:.2f}%，但主力资金净流出，可能存在杠杆资金追高风险。")
+                risk_flags.append(f"融资余额环比上升 {margin_change:.2f}%，但主力流出，存在杠杆追高风险。")
             elif margin_change < -3:
                 score -= 3
-                risk_flags.append(f"融资余额环比下降约 {abs(margin_change):.2f}%，杠杆资金参与度下降。")
-            else:
-                key_findings.append(
-                    f"融资余额环比变化约为 {margin_change:.2f}%，变化幅度不大，杠杆资金信号偏中性。"
-                )
+                risk_flags.append(f"融资余额环比下降 {abs(margin_change):.2f}%，杠杆参与度下降。")
 
-        if margin_active is not None:
-            margin_active = _safe_float(margin_active)
-            if margin_active > 5:
-                key_findings.append(f"融资买入额/融资余额约为 {margin_active:.2f}%，融资买入活跃度较高。")
-    else:
-        risk_flags.append("融资融券数据不可用，本次资金因子未纳入杠杆资金判断。")
+    if indicators.get("stale_cache"):
+        score -= 2
+        risk_flags.append("本次使用最近成功缓存，数据时效性低于在线实时数据。")
 
-    # 9. 数据质量
-    warnings = indicators.get("warnings") or []
-    if warnings:
-        risk_flags.extend([str(w) for w in warnings])
-        score -= 3
+    if not has_3d:
+        key_findings.append(
+            f"当前数据源仅提供 {int(indicators.get('history_days') or 0)} 个交易日，未生成近3日/近5日趋势结论。"
+        )
+    elif not has_5d:
+        key_findings.append("当前历史数据不足5个交易日，未生成近5日趋势结论。")
 
-    # 低分保护：
-    # 如果只是主力资金持续流出，但没有出现散户接盘、异常大额流出、
-    # 股价资金背离、融资追高等复合风险，则不轻易打到个位数。
-    severe_compound_risk = (
+    score = int(round(score))
+    severe = bool(
         indicators.get("retail_chasing_risk")
         or indicators.get("abnormal_large_outflow")
         or indicators.get("price_fund_divergence")
     )
-
-    margin_change_for_floor = indicators.get("margin_balance_change_rate")
-    if margin_change_for_floor is not None:
-        margin_change_for_floor = _safe_float(margin_change_for_floor)
-        if margin_change_for_floor > 5 and latest_main < 0:
-            severe_compound_risk = True
-
-    score = int(round(score))
-
-    if score < 20 and not severe_compound_risk:
+    if score < 20 and not severe:
         score = 20
-
     score = max(0, min(100, score))
 
-    if score >= 60:
-        trend_signal = "Bullish"
-    elif score >= 40:
-        trend_signal = "Neutral"
-    else:
-        trend_signal = "Bearish"
-
-    if not key_findings:
-        key_findings.append("资金流入流出信号混杂，资金面暂未形成明确方向。")
-
-    # 去重并限制长度
-    key_findings = list(dict.fromkeys(key_findings))[:6]
+    trend_signal = "Bullish" if score >= 60 else "Neutral" if score >= 40 else "Bearish"
+    key_findings = list(dict.fromkeys(key_findings))[:7]
     risk_flags = list(dict.fromkeys(risk_flags))[:6]
 
     return {
@@ -886,11 +1197,6 @@ def score_capital_factor(indicators: dict[str, Any]) -> dict[str, Any]:
         "key_findings": key_findings,
         "risk_flags": risk_flags,
     }
-
-
-# =========================
-# Prompt 数据与 Evidence 构建
-# =========================
 
 def build_capital_prompt_data(indicators: dict[str, Any]) -> str:
     """
@@ -915,91 +1221,83 @@ def build_capital_prompt_data(indicators: dict[str, Any]) -> str:
 
 
 def build_raw_data_summary(indicators: dict[str, Any]) -> str:
-    """
-    生成 raw_data_summary，保证即使没有 LLM 也能输出。
-    """
+    """生成完全由实际资金数据驱动的摘要，不由 LLM 覆盖。"""
     if not indicators.get("data_available"):
         return "个股资金流数据不可用，资金因子暂按中性处理。"
 
-    parts = []
-
-    date = indicators.get("latest_trade_date")
-    if date:
-        parts.append(f"最新资金流交易日为 {date}")
-
-    parts.append(
-        f"最近一日{_format_flow_direction(indicators.get('latest_main_net_inflow', 0))}"
-    )
-    parts.append(
-        f"近3日{_format_flow_direction(indicators.get('main_net_inflow_3d_sum', 0))}"
-    )
-    parts.append(
-        f"近5日{_format_flow_direction(indicators.get('main_net_inflow_5d_sum', 0))}"
-    )
-    parts.append(
-        f"近5日主力净流入占比均值约为 {_safe_float(indicators.get('main_net_inflow_ratio_5d_mean')):.2f}%"
-    )
-
-    super_flow = _safe_float(indicators.get("latest_super_large_net_inflow"))
-    large_flow = _safe_float(indicators.get("latest_large_net_inflow"))
-    medium_flow = _safe_float(indicators.get("latest_medium_net_inflow"))
-    small_flow = _safe_float(indicators.get("latest_small_net_inflow"))
-
-    if super_flow != 0 or large_flow != 0:
-        parts.append(
-            f"最近一日{_format_flow_direction(super_flow, '超大单资金')}，"
-            f"{_format_flow_direction(large_flow, '大单资金')}"
-        )
-
-    if medium_flow != 0 or small_flow != 0:
-        parts.append(
-            f"最近一日{_format_flow_direction(medium_flow, '中单资金')}，"
-            f"{_format_flow_direction(small_flow, '小单资金')}"
-        )
-
-    if indicators.get("rank_available"):
-        rank_summary = indicators.get("fund_flow_rank_summary")
-        if isinstance(rank_summary, dict):
-            rank_5d_ratio = rank_summary.get("5日主力净流入-净占比")
-            rank_5d_amt = rank_summary.get("5日主力净流入-净额")
-
-            if rank_5d_ratio is not None and rank_5d_amt is not None:
-                parts.append(
-                    f"资金流排名数据中，近5日主力净流入为 "
-                    f"{_format_flow_direction(_safe_float(rank_5d_amt), '主力资金')}，"
-                    f"净占比约为 {_safe_float(rank_5d_ratio):.2f}%"
-                )
-
-    if indicators.get("margin_available"):
-        change = indicators.get("margin_balance_change_rate")
-        active_ratio = indicators.get("margin_buy_active_ratio")
-
-        if change is not None:
-            change_value = _safe_float(change)
-
-            if abs(change_value) < 3:
-                parts.append(
-                    f"融资余额环比变化约为 {change_value:.2f}%，变化幅度不大，杠杆资金信号偏中性"
-                )
-            elif change_value > 0:
-                parts.append(
-                    f"融资余额环比上升约为 {change_value:.2f}%，杠杆资金参与度有所提高"
-                )
-            else:
-                parts.append(
-                    f"融资余额环比下降约为 {abs(change_value):.2f}%，杠杆资金参与度有所下降"
-                )
-
-        if active_ratio is not None:
-            parts.append(
-                f"融资买入额/融资余额约为 {_safe_float(active_ratio):.2f}%"
-            )
-
+    source = str(indicators.get("data_source") or "unknown")
+    source_lower = source.lower()
+    if source_lower.startswith("cache:"):
+        source_name = "本地最近成功缓存"
+    elif "eastmoney_history" in source_lower:
+        source_name = "东方财富历史资金流"
+    elif "eastmoney_snapshot" in source_lower:
+        source_name = "东方财富实时资金快照"
+    elif "ths_" in source_lower:
+        source_name = "同花顺备用资金流"
     else:
-        parts.append("融资融券数据不可用或未覆盖该股票")
+        source_name = source
+
+    rows = int(indicators.get("history_days") or indicators.get("raw_rows") or 0)
+    date = indicators.get("latest_trade_date")
+    head = f"数据源为{source_name}，实际获得 {rows} 个交易日"
+    if date:
+        head += f"，最新交易日为 {date}"
+
+    parts = [head]
+
+    latest_main = _safe_float(indicators.get("latest_main_net_inflow"))
+    latest_ratio_raw = indicators.get("latest_main_net_inflow_ratio")
+    latest_text = f"最近一日{_format_flow_direction(latest_main)}"
+    if latest_ratio_raw is not None:
+        latest_text += f"，净流入占比 {_safe_float(latest_ratio_raw):.2f}%"
+    parts.append(latest_text)
+
+    if indicators.get("has_3d_history"):
+        parts.append(
+            f"近3日{_format_flow_direction(indicators.get('main_net_inflow_3d_sum'), '主力资金合计')}"
+        )
+    else:
+        parts.append("因历史样本不足3日，未计算近3日主力趋势")
+
+    if indicators.get("has_5d_history"):
+        parts.append(
+            f"近5日{_format_flow_direction(indicators.get('main_net_inflow_5d_sum'), '主力资金合计')}"
+        )
+        parts.append(
+            f"近5日主力净流入占比均值 {_safe_float(indicators.get('main_net_inflow_ratio_5d_mean')):.2f}%"
+        )
+    else:
+        parts.append("因历史样本不足5日，未计算近5日主力趋势")
+
+    if indicators.get("flow_level_detail_available"):
+        parts.append(
+            "最近一日分单结构为："
+            f"{_format_flow_direction(indicators.get('latest_super_large_net_inflow'), '超大单资金')}，"
+            f"{_format_flow_direction(indicators.get('latest_large_net_inflow'), '大单资金')}，"
+            f"{_format_flow_direction(indicators.get('latest_medium_net_inflow'), '中单资金')}，"
+            f"{_format_flow_direction(indicators.get('latest_small_net_inflow'), '小单资金')}"
+        )
+    else:
+        parts.append("当前备用数据源未提供完整的超大单、大单、中单和小单拆分")
+
+    latest_pct = indicators.get("latest_pct_change")
+    if latest_pct is not None:
+        parts.append(f"最近一日涨跌幅为 {_safe_float(latest_pct):.2f}%")
+
+    inflow_days = int(indicators.get("consecutive_inflow_days") or 0)
+    outflow_days = int(indicators.get("consecutive_outflow_days") or 0)
+    if inflow_days >= 2:
+        parts.append(f"主力资金连续 {inflow_days} 个交易日净流入")
+    elif outflow_days >= 2:
+        parts.append(f"主力资金连续 {outflow_days} 个交易日净流出")
+
+    if indicators.get("price_fund_divergence"):
+        parts.append("股价上涨但主力净流出，存在价格—资金背离")
+    if indicators.get("stale_cache"):
+        parts.append("在线源失败，本次使用缓存数据，需注意时效性")
 
     return "；".join(parts) + "。"
-
 
 def build_capital_evidence(
     stock_name: str,
@@ -1008,42 +1306,23 @@ def build_capital_evidence(
     llm_result: Optional[dict[str, Any]] = None,
 ) -> FactorEvidence:
     """
-    生成 FactorEvidence。
+    构造资金证据。
 
-    注意：
-    - score 和 trend_signal 以规则评分为准。
-    - LLM 只允许补充 key_findings、risk_flags、raw_data_summary 的表达。
+    资金面属于强结构化数值分析：规则结果和实际数据摘要是事实主干，
+    LLM 不得覆盖 key_findings、risk_flags 或 raw_data_summary，避免不同股票被写成同一模板。
+    参数 llm_result 仅为兼容旧调用保留。
     """
     scored = score_capital_factor(indicators)
-
-    key_findings = scored["key_findings"]
-    risk_flags = scored["risk_flags"]
     raw_data_summary = build_raw_data_summary(indicators)
-
-    if isinstance(llm_result, dict):
-        llm_findings = llm_result.get("key_findings")
-        llm_risks = llm_result.get("risk_flags")
-        llm_summary = llm_result.get("raw_data_summary")
-
-        if isinstance(llm_findings, list) and llm_findings:
-            key_findings = [str(x) for x in llm_findings][:5]
-
-        if isinstance(llm_risks, list):
-            merged_risks = risk_flags + [str(x) for x in llm_risks]
-            risk_flags = list(dict.fromkeys(merged_risks))[:5]
-
-        if isinstance(llm_summary, str) and llm_summary.strip():
-            raw_data_summary = llm_summary.strip()
 
     return FactorEvidence(
         factor_name="capital",
         trend_signal=scored["trend_signal"],
         score=scored["score"],
-        key_findings=key_findings,
-        risk_flags=risk_flags,
+        key_findings=scored["key_findings"],
+        risk_flags=scored["risk_flags"],
         raw_data_summary=f"{stock_name}（{stock_code}）资金因子：{raw_data_summary}",
     )
-
 
 def analyze_capital_factor(
     stock_name: str,

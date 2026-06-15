@@ -1523,142 +1523,154 @@ def _capital_fallback_evidence(
     }
 
 
-def capital_analysis_node(state: AgentState, planner: BasePlanner) -> dict:
-    """
-    Capital factor analysis node.
-
-    Contract:
-    - input: AgentState + BasePlanner
-    - output: {"capital_evidence": FactorEvidence, "evidence_log": [EvidenceItem]}
-    """
+def capital_analysis_node(
+    state: AgentState,
+    planner: BasePlanner,
+) -> dict:
+    """资金因子节点：直接使用结构化资金数据生成差异化报告。"""
     log_node_start("capital_analysis_node")
 
     try:
         if not _should_analyze(state, "capital"):
-            log_info("capital_analysis", {"status": "skipped"})
-            log_node_end("capital_analysis_node", {"status": "skipped"})
+            log_info(
+                "capital_analysis",
+                {"status": "skipped"},
+            )
+            log_node_end(
+                "capital_analysis_node",
+                {"status": "skipped"},
+            )
             return {"capital_evidence": None}
     except Exception:
-        # 如果路由信息异常，不阻断资金因子；默认继续分析。
         pass
 
-    intent_obj = _state_get(state, "user_intent", None)
+    intent_obj = _state_get(
+        state,
+        "user_intent",
+        None,
+    )
 
     stock_code = (
         _state_get(state, "stock_code", None)
         or getattr(intent_obj, "stock_code", None)
         or ""
     )
+
     stock_name = (
         _state_get(state, "stock_name", None)
         or getattr(intent_obj, "stock_name", None)
         or stock_code
     )
-    user_intent = (
-        getattr(intent_obj, "intent_type", None)
-        or _state_get(state, "intent_type", None)
-        or "analysis"
-    )
-    time_horizon = (
-        _state_get(state, "time_horizon", None)
-        or getattr(intent_obj, "time_horizon", None)
-        or "medium"
-    )
-    market_structure = _state_get(state, "market_structure", None)
 
     if not stock_code:
         result = _capital_fallback_evidence(
             stock_name=str(stock_name or "UNKNOWN"),
             stock_code="UNKNOWN",
-            message="AgentState 中缺少 stock_code，无法执行资金因子分析。",
+            message=(
+                "AgentState 中缺少 stock_code，"
+                "无法执行资金因子分析。"
+            ),
             confidence=0.30,
         )
+
         evidence = result["capital_evidence"]
+
         log_node_end(
             "capital_analysis_node",
-            {"score": evidence.score, "status": "missing_stock_code"},
+            {
+                "score": evidence.score,
+                "status": "missing_stock_code",
+            },
         )
         return result
 
     try:
-        # 1. AkShare 数据获取
-        flow_df = fetch_capital_flow(str(stock_code))
-        rank_df = fetch_fund_flow_rank(str(stock_code), indicator="5日")
-        margin_df = fetch_margin_data(str(stock_code))
-
-        # 2. 资金指标计算
-        indicators = calculate_capital_indicators(
-            flow_df=flow_df,
-            margin_df=margin_df,
-            rank_df=rank_df,
+        flow_df = fetch_capital_flow(
+            str(stock_code),
+            days=20,
         )
 
-        # 3. 构造 LLM prompt 数据
-        capital_prompt_data = build_capital_prompt_data(indicators)
+        indicators = calculate_capital_indicators(
+            flow_df=flow_df,
+            margin_df=None,
+            rank_df=None,
+        )
 
-        system_prompt = _load_prompt_with_append("capital_system", state)
-        user_template = _load_prompt_file("prompts/capital_user.md")
-
-        if not system_prompt:
-            system_prompt = "你是资金因子分析助手。只能基于给定结构化数据解释，不得编造不存在的数据。"
-
-        if user_template:
-            user_prompt = _render_capital_user_prompt(
-                user_template,
-                stock_name=stock_name,
-                stock_code=stock_code,
-                user_intent=user_intent,
-                time_horizon=time_horizon,
-                market_structure=market_structure,
-                capital_indicators=capital_prompt_data,
-            )
-        else:
-            user_prompt = f"""
-请基于以下结构化资金因子数据，输出 JSON。
-
-股票：{stock_name}（{stock_code}）
-用户意图：{user_intent}
-分析周期：{time_horizon}
-市场结构：{market_structure}
-
-资金因子数据：
-{capital_prompt_data}
-"""
-
-        # 4. LLM 解释。失败时返回空 dict，后续仍使用规则评分结果。
-        llm_result = _call_planner_for_capital(planner, system_prompt, user_prompt)
-
-        # 5. 构造 FactorEvidence
         evidence = build_capital_evidence(
             stock_name=str(stock_name),
             stock_code=str(stock_code),
             indicators=indicators,
-            llm_result=llm_result,
+            llm_result=None,
         )
 
-        # 6. 动态置信度，用 EvidenceItem 传给 workflow
-        confidence = 0.70
-        if indicators.get("data_available"):
-            confidence += 0.10
-        if indicators.get("rank_available"):
-            confidence += 0.05
-        if indicators.get("margin_available"):
-            confidence += 0.05
+        rows = int(
+            indicators.get("history_days") or 0
+        )
+
+        confidence = 0.62
+
+        if rows >= 5:
+            confidence = 0.88
+        elif rows >= 3:
+            confidence = 0.78
+        elif rows >= 1:
+            confidence = 0.66
+
+        if indicators.get("stale_cache"):
+            confidence -= 0.12
+
         if indicators.get("warnings"):
-            confidence -= 0.15
-        confidence = max(0.30, min(0.90, confidence))
+            confidence -= 0.05
+
+        confidence = max(
+            0.30,
+            min(0.90, confidence),
+        )
 
         item = EvidenceItem(
             source="capital",
-            content=evidence.raw_data_summary or "资金面分析",
+            content=(
+                evidence.raw_data_summary
+                or "资金面分析"
+            ),
             evidence_type="score",
             score=evidence.score,
             confidence=confidence,
         )
 
+        log_info(
+            "capital_analysis",
+            {
+                "status": "capital_data_ready",
+                "stock_code": str(stock_code),
+                "rows": rows,
+                "data_source": indicators.get(
+                    "data_source",
+                    "unknown",
+                ),
+                "data_quality": indicators.get(
+                    "data_quality",
+                    "unknown",
+                ),
+                "latest_main_net_inflow":
+                    indicators.get(
+                        "latest_main_net_inflow"
+                    ),
+                "score": evidence.score,
+            },
+        )
+
         log_node_end(
             "capital_analysis_node",
-            {"score": evidence.score, "signal": evidence.trend_signal},
+            {
+                "score": evidence.score,
+                "signal": evidence.trend_signal,
+                "rows": rows,
+                "source": indicators.get(
+                    "data_source",
+                    "unknown",
+                ),
+            },
         )
 
         return {
@@ -1667,21 +1679,35 @@ def capital_analysis_node(state: AgentState, planner: BasePlanner) -> dict:
         }
 
     except Exception as e:
-        log_error("capital_analysis", RuntimeError(f"Analysis failed: {e}"))
+        log_error(
+            "capital_analysis",
+            RuntimeError(
+                f"Analysis failed: {e}"
+            ),
+        )
 
         result = _capital_fallback_evidence(
             stock_name=str(stock_name),
             stock_code=str(stock_code),
-            message=f"资金因子节点执行失败，已返回中性兜底结果: {str(e)}",
+            message=(
+                "资金因子节点执行失败，"
+                "已返回中性兜底结果: "
+                f"{str(e)}"
+            ),
             confidence=0.30,
         )
+
         evidence = result["capital_evidence"]
+
         log_node_end(
             "capital_analysis_node",
-            {"score": evidence.score, "status": "fallback"},
+            {
+                "score": evidence.score,
+                "status": "fallback",
+            },
         )
-        return result
 
+        return result
 
 def sentiment_analysis_node(state: AgentState, planner: BasePlanner) -> dict:
     """Sentiment factor analysis with dynamic branching based on time horizon.
@@ -1907,11 +1933,23 @@ def final_answer_node(state: AgentState, planner: BasePlanner) -> dict:
         ("情绪面", sent),
     ]:
         if ev:
-            lines.append(f"  {name}: {ev.trend_signal} (评分: {ev.score}/100)")
+            lines.append(
+                f"  {name}: {ev.trend_signal} "
+                f"(评分: {ev.score}/100)"
+            )
+
+            if name == "资金面" and ev.raw_data_summary:
+                lines.append(
+                    f"    数据概览: {ev.raw_data_summary}"
+                )
+
             for finding in ev.key_findings:
                 lines.append(f"    - {finding}")
+
             if ev.risk_flags:
-                lines.append(f"    风险: {', '.join(ev.risk_flags)}")
+                lines.append(
+                    f"    风险: {', '.join(ev.risk_flags)}"
+                )
         else:
             lines.append(f"  {name}: 未分析")
     lines.append("")
